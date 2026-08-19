@@ -230,8 +230,24 @@ def main():
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("البوت شغال...")
-    app.run_polling()
+    # Render بيحقن هالمتغير تلقائياً برابط الخدمة (https://your-app.onrender.com)
+    # لو موجود، منشغل بطريقة Webhook (يناسب خطة Render المجانية)
+    # لو مو موجود (Railway أو تشغيل محلي)، منشغل بطريقة Polling العادية
+    render_url = os.environ.get("RENDER_EXTERNAL_URL")
+
+    if render_url:
+        port = int(os.environ.get("PORT", "10000"))
+        webhook_url = f"{render_url}/{TELEGRAM_TOKEN}"
+        logger.info("البوت شغال بطريقة Webhook على Render...")
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=TELEGRAM_TOKEN,
+            webhook_url=webhook_url,
+        )
+    else:
+        logger.info("البوت شغال بطريقة Polling...")
+        app.run_polling()
 
 
 if __name__ == "__main__":
