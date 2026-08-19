@@ -16,14 +16,11 @@ if not GEMINI_API_KEY:
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-# الموديل الأساسي: Gemini 2.5 Pro - الأذكى والأقوى بالفهم والتحليل (مجاني، بس حصته اليومية أصغر)
-# الموديل الاحتياطي: Gemini 2.5 Flash - لو خلصت حصة الـ Pro اليومية، البوت بيتحول له تلقائياً بدون توقف
 PRIMARY_MODEL = "gemini-2.5-pro"
 FALLBACK_MODEL = "gemini-2.5-flash"
 
 OFFICE_WEBSITE = "https://alshabaoffice.netlify.app/"
 
-# شخصية الوكيل - عدّل هالنص متل ما بدك يتصرف الوكيل
 SYSTEM_INSTRUCTION = """
 انت وكيل ذكي لمكتب "الشهباء العقاري" بحلب، سوريا. اسمك "وكيل الشهباء".
 مهمتك تساعد صاحب المكتب بإدارة أعماله: العقارات، الزباين، السوشيال ميديا.
@@ -55,7 +52,6 @@ SYSTEM_INSTRUCTION = """
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# إعدادات مشتركة للموديلين: تعليمات الشخصية + أداة البحث بالإنترنت + قراءة الروابط + دقة الردود
 CHAT_CONFIG = types.GenerateContentConfig(
     system_instruction=SYSTEM_INSTRUCTION,
     tools=[
@@ -67,8 +63,6 @@ CHAT_CONFIG = types.GenerateContentConfig(
     max_output_tokens=2048,
 )
 
-# ---------- ذاكرة محادثة بسيطة لكل مستخدم (مؤقتة، بتنمسح لو البوت أعاد التشغيل) ----------
-# كل عنصر: {"model": "primary" أو "fallback", "chat": جلسة المحادثة}
 user_chats = {}
 
 
@@ -82,7 +76,6 @@ def get_chat_session(user_id: int):
 
 
 def switch_to_fallback(user_id: int):
-    """لو الموديل الأساسي خلصت حصته اليومية، بننقل نفس تاريخ المحادثة للموديل الاحتياطي."""
     old_history = user_chats[user_id]["chat"].get_history()
     new_chat = client.chats.create(model=FALLBACK_MODEL, config=CHAT_CONFIG, history=old_history)
     user_chats[user_id] = {"model": "fallback", "chat": new_chat}
@@ -153,7 +146,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     try:
-        # نأخذ أعلى جودة متاحة للصورة
         photo_file = await update.message.photo[-1].get_file()
         photo_bytes = await photo_file.download_as_bytearray()
 
@@ -230,24 +222,8 @@ def main():
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Render بيحقن هالمتغير تلقائياً برابط الخدمة (https://your-app.onrender.com)
-    # لو موجود، منشغل بطريقة Webhook (يناسب خطة Render المجانية)
-    # لو مو موجود (Railway أو تشغيل محلي)، منشغل بطريقة Polling العادية
-    render_url = os.environ.get("RENDER_EXTERNAL_URL")
-
-    if render_url:
-        port = int(os.environ.get("PORT", "10000"))
-        webhook_url = f"{render_url}/{TELEGRAM_TOKEN}"
-        logger.info("البوت شغال بطريقة Webhook على Render...")
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            url_path=TELEGRAM_TOKEN,
-            webhook_url=webhook_url,
-        )
-    else:
-        logger.info("البوت شغال بطريقة Polling...")
-        app.run_polling()
+    logger.info("البوت شغال بطريقة Polling...")
+    app.run_polling()
 
 
 if __name__ == "__main__":
