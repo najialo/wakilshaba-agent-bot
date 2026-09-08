@@ -1,9 +1,10 @@
 import asyncio
+import base64
 import logging
 import os
 import re
-from google import genai
-from google.genai import types
+
+from groq import Groq
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -15,17 +16,18 @@ from telegram.ext import (
 
 # ---------- الإعدادات والمتغيرات ----------
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
-if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
+if not TELEGRAM_TOKEN or not GROQ_API_KEY:
     raise RuntimeError(
-        "TELEGRAM_TOKEN أو GEMINI_API_KEY غير موجودين في متغيرات البيئة (Environment Variables)"
+        "TELEGRAM_TOKEN أو GROQ_API_KEY غير موجودين في متغيرات البيئة (Environment Variables)"
     )
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+client = Groq(api_key=GROQ_API_KEY)
 
-PRIMARY_MODEL = "gemini-2.5-pro"
-FALLBACK_MODEL = "gemini-2.5-flash"
+TEXT_MODEL = "llama-3.3-70b-versatile"
+VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+AUDIO_MODEL = "whisper-large-v3"
 
 OFFICE_WEBSITE = "https://alshabaoffice.netlify.app/"
 
@@ -40,7 +42,7 @@ SYSTEM_INSTRUCTION = """
 
 طريقة ردك:
 - احكي بالعامية السورية دايماً، بشكل ودود ومباشر ومختصر (بلا حشو أو مقدمات طويلة).
-- لما حد يسألك عن الذهب أو الفضة، استخدم أداة البحث Google Search لتقديم أسعار مباشرة وتحليل فني ودقيق من مصادر موثوقة.
+- لما حد يسألك عن الذهب أو الفضة، أعطي تحليل فني عام حسب معرفتك، ونبّه إنه الأسعار تقريبية ومش لحظية لأنه ما عندك اتصال مباشر بالإنترنت هلق.
 - لو انبعتلك صورة عقار، وصفها بالتفصيل وأعطي رأيك فيها.
 
 مصدرك الأساسي للعقارات - موقع المكتب:
@@ -50,43 +52,40 @@ SYSTEM_INSTRUCTION = """
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-CHAT_CONFIG = types.GenerateContentConfig(
-    system_instruction=SYSTEM_INSTRUCTION,
-    tools=[types.Tool(google_search=types.GoogleSearch())],
-    temperature=0.4,
-    top_p=0.9,
-    max_output_tokens=2048,
-)
+MAX_HISTORY_MESSAGES = 20  # عدد رسائل المحادثة المحفوظة لكل مستخدم (بدون العد system)
 
-user_chats = {}
+user_histories = {}
 user_alerts = {}
 
 
-def get_chat_session(user_id: int):
-    if user_id not in user_chats:
-        user_chats[user_id] = {
-            "model": "primary",
-            "chat": client.chats.create(
-                model=PRIMARY_MODEL, config=CHAT_CONFIG
-            ),
-        }
-    return user_chats[user_id]
+def get_history(user_id: int):
+    if user_id not in user_histories:
+        user_histories[user_id] = [
+            {"role": "system", "content": SYSTEM_INSTRUCTION}
+        ]
+    return user_histories[user_id]
 
 
-def switch_to_fallback(user_id: int):
-    old_history = user_chats[user_id]["chat"].get_history()
-    new_chat = client.chats.create(
-        model=FALLBACK_MODEL, config=CHAT_CONFIG, history=old_history
+def trim_history(history):
+    if len(history) > MAX_HISTORY_MESSAGES + 1:
+        history[:] = [history[0]] + history[-MAX_HISTORY_MESSAGES:]
+
+
+def chat_with_groq(user_id: int, user_content):
+    history = get_history(user_id)
+    history.append({"role": "user", "content": user_content})
+    trim_history(history)
+
+    completion = client.chat.completions.create(
+        model=TEXT_MODEL,
+        messages=history,
+        temperature=0.4,
+        max_tokens=2048,
     )
-    user_chats[user_id] = {"model": "fallback", "chat": new_chat}
-    return user_chats[user_id]
-
-
-def is_quota_error(error: Exception) -> bool:
-    err_text = str(error).lower()
-    return (
-        "quota" in err_text or "429" in err_text or "resource_exhausted" in err_text
-    )
+    reply = completion.choices[0].message.content
+    history.append({"role": "assistant", "content": reply})
+    trim_history(history)
+    return reply
 
 
 # ---------- الأوامر والمعالجات ----------
@@ -105,7 +104,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user_chats.pop(user_id, None)
+    user_histories.pop(user_id, None)
     await update.message.reply_text("تمام، مسحت الذاكرة وبلشنا محادثة جديدة.")
 
 
@@ -114,32 +113,18 @@ async def analyze_site(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(
         chat_id=update.effective_chat.id, action="typing"
     )
-    await update.message.reply_text("عم افتح الموقع وأحلله، ثانية...")
+    await update.message.reply_text("عم افكر بموقع المكتب...")
 
     analysis_prompt = f"""
-افتح موقع المكتب {OFFICE_WEBSITE} هلق واقرا محتواه الفعلي، وسويلي تحليل شامل يتضمن:
-1. عدد العقارات المعروضة حالياً ونوعها (بيع/إيجار)
-2. نطاق الأسعار (الأقل والأعلى)
-3. أكتر منطقة/حي فيه عروض
-4. أي عقار ناقصو معلومات أساسية
-5. اقتراح عملي لتحسين عرض الموقع
+موقع مكتب الشهباء العقاري هو {OFFICE_WEBSITE}. بما إنه ما عندك اتصال مباشر بالإنترنت هلق،
+اعطيني نصايح عامة كيف أحسّن عرض العقارات على موقع زي هيك (وصف واضح، صور كتيرة، سعر ونطاق، الحي، معلومات التواصل)
+وشو أهم نقاط لازم أراجعها بنفسي على الموقع.
 """
-    session = get_chat_session(user_id)
     try:
-        response = session["chat"].send_message(analysis_prompt)
-        reply = response.text
-    except Exception as e:
-        if is_quota_error(e) and session["model"] == "primary":
-            try:
-                session = switch_to_fallback(user_id)
-                response = session["chat"].send_message(analysis_prompt)
-                reply = response.text
-            except Exception:
-                logger.exception("خطأ بتحليل الموقع")
-                reply = "ما قدرت أفتح الموقع هلق، جرب كمان مرة بعد شوي 🙏"
-        else:
-            logger.exception("خطأ بتحليل الموقع")
-            reply = "ما قدرت أفتح الموقع هلق، جرب كمان مرة بعد شوي 🙏"
+        reply = chat_with_groq(user_id, analysis_prompt)
+    except Exception:
+        logger.exception("خطأ بتحليل الموقع")
+        reply = "ما قدرت أحلل الموضوع هلق، جرب كمان مرة بعد شوي 🙏"
 
     await update.message.reply_text(reply)
 
@@ -157,12 +142,30 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         photo_file = await update.message.photo[-1].get_file()
         photo_bytes = await photo_file.download_as_bytearray()
-        session = get_chat_session(user_id)
-        image_part = types.Part.from_bytes(
-            data=bytes(photo_bytes), mime_type="image/jpeg"
+        b64_image = base64.b64encode(bytes(photo_bytes)).decode("utf-8")
+        image_data_url = f"data:image/jpeg;base64,{b64_image}"
+
+        completion = client.chat.completions.create(
+            model=VISION_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_INSTRUCTION},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": caption},
+                        {"type": "image_url", "image_url": {"url": image_data_url}},
+                    ],
+                },
+            ],
+            temperature=0.4,
+            max_tokens=1024,
         )
-        response = session["chat"].send_message([caption, image_part])
-        reply = response.text
+        reply = completion.choices[0].message.content
+
+        history = get_history(user_id)
+        history.append({"role": "user", "content": f"[صورة] {caption}"})
+        history.append({"role": "assistant", "content": reply})
+        trim_history(history)
     except Exception:
         logger.exception("خطأ بتحليل الصورة")
         reply = "ما قدرت أحلل الصورة، جرب تبعتها كمان مرة 🙏"
@@ -179,17 +182,14 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         voice_file = await update.message.voice.get_file()
         voice_bytes = await voice_file.download_as_bytearray()
-        session = get_chat_session(user_id)
-        audio_part = types.Part.from_bytes(
-            data=bytes(voice_bytes), mime_type="audio/ogg"
+
+        transcription = client.audio.transcriptions.create(
+            file=("voice.ogg", bytes(voice_bytes)),
+            model=AUDIO_MODEL,
         )
-        response = session["chat"].send_message(
-            [
-                "افهم هالرسالة الصوتية ورد عليها متل ما لو كانت مكتوبة.",
-                audio_part,
-            ]
-        )
-        reply = response.text
+        text = transcription.text
+
+        reply = chat_with_groq(user_id, text)
     except Exception:
         logger.exception("خطأ بتحليل الصوت")
         reply = "ما قدرت أسمع الرسالة الصوتية منيح، جرب تبعتها كمان مرة 🙏"
@@ -204,7 +204,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id=update.effective_chat.id, action="typing"
     )
 
-    # 1. التعرف التلقائي على طلبات التنبيه (مثال: نبهني على الذهب 2500 أو نبهني على الفضة تحت 30)
     alert_match = re.search(
         r"نبهني\s+على\s+(الذهب|الفضة|ذهب|فضة)\s+(?:عند|تحت)?\s*(\d+)",
         text,
@@ -224,28 +223,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # 2. الإجابة عن كل الأسئلة وتحليل الذهب والفضة عبر النموذج الذكي
-    session = get_chat_session(user_id)
     try:
-        response = session["chat"].send_message(text)
-        reply = response.text
-    except Exception as e:
-        if is_quota_error(e) and session["model"] == "primary":
-            try:
-                session = switch_to_fallback(user_id)
-                response = session["chat"].send_message(text)
-                reply = response.text
-            except Exception:
-                logger.exception("خطأ بالرد من الموديل الاحتياطي")
-                reply = "صار خطأ تقني بسيط، جرب كمان مرة بعد شوي 🙏"
-        else:
-            logger.exception("خطأ بالرد")
-            reply = "صار خطأ تقني بسيط، جرب كمان مرة بعد شوي 🙏"
+        reply = chat_with_groq(user_id, text)
+    except Exception:
+        logger.exception("خطأ بالرد")
+        reply = "صار خطأ تقني بسيط، جرب كمان مرة بعد شوي 🙏"
 
     await update.message.reply_text(reply)
 
 
-# ---------- تشغيل البوت المترابط لـ Render و Railway ----------
+# ---------- تشغيل البوت ----------
 
 
 async def run_bot():
